@@ -9,7 +9,7 @@ Features
 --------
 - Auto-connect: scans serial ports, probes with "VER?" and opens the matching device.
 - Robust command layer with timeouts and telemetry noise filtering.
-- Live telemetry panel (VIN, TEMPADC, Temperature, FanIdx, Duty, LOAD, PG, MODE).
+- Live telemetry panel (VIN, TEMPADC, Temperature, FanIdx, Duty, LOAD, MODE).
 - Parameter editor with type/units validation and inline tooltips (hover bubbles).
 - LUT management (pull/push) kept minimal for clarity; extend as needed.
 - Start/Stop logging handled by the host application (separate feature).
@@ -37,6 +37,8 @@ import time
 import queue
 import re
 import sys
+import traceback
+import yaml
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -50,6 +52,57 @@ APP_NAME = "E-DDY Config"
 EXPECTED_NAME = "E-DDY"
 MIN_FW = (1, 3, 1)  # minimal compatible firmware version (major, minor, patch)
 
+
+# Custom error dialog with copy-to-clipboard functionality
+def show_error_dialog(title: str, message: str, details: str = None):
+    """Show error dialog with copyable text and optional clipboard button."""
+    dialog = tk.Toplevel()
+    dialog.title(title)
+    dialog.geometry("500x300")
+    dialog.resizable(True, True)
+    
+    # Message frame
+    msg_frame = ttk.Frame(dialog, padding=10)
+    msg_frame.pack(fill=tk.BOTH, expand=True)
+    
+    # Text widget with scrollbar for selectable/copyable text
+    text_scroll = ttk.Scrollbar(msg_frame)
+    text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    text_widget = tk.Text(msg_frame, wrap=tk.WORD, yscrollcommand=text_scroll.set, 
+                          height=10, relief=tk.SOLID, borderwidth=1)
+    text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    text_scroll.config(command=text_widget.yview)
+    
+    # Insert message
+    full_text = f"{message}"
+    if details:
+        full_text += f"\n\nDetails:\n{details}"
+    text_widget.insert("1.0", full_text)
+    text_widget.config(state=tk.DISABLED)  # Make read-only but still selectable
+    
+    # Button frame
+    btn_frame = ttk.Frame(dialog, padding=10)
+    btn_frame.pack(fill=tk.X)
+    
+    def copy_to_clipboard():
+        dialog.clipboard_clear()
+        dialog.clipboard_append(full_text)
+        copy_btn.config(text="✓ Copied!")
+        dialog.after(1500, lambda: copy_btn.config(text="Copy to Clipboard"))
+    
+    copy_btn = ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard)
+    copy_btn.pack(side=tk.LEFT, padx=5)
+    
+    ttk.Button(btn_frame, text="OK", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    # Center dialog on parent
+    dialog.transient(dialog.master)
+    dialog.grab_set()
+    dialog.focus_set()
+    dialog.wait_window()
+
+
 CSV_HEADER = [
     "vin_v",
     "tempadc_v",
@@ -57,7 +110,6 @@ CSV_HEADER = [
     "fan_idx",
     "duty_pct",
     "load",
-    "pg",
     "mode",
 ]
 
@@ -330,6 +382,44 @@ class Dev:
             return first
         raise RuntimeError(first)
 
+    def get_lut_temp_to_duty(self) -> List[Tuple[float, float]]:
+        """Get TEMP_TO_DUTY LUT from device."""
+        first, lines = self.cmd("GET LUT TEMP_TO_DUTY", expect_multiline=True, deadline_s=2.0)
+        if not first.startswith("OK"):
+            raise RuntimeError(first)
+        lut = []
+        for s in lines:
+            if s == "END":
+                break
+            if s.startswith("COUNT"):
+                continue
+            parts = s.split(",")
+            if len(parts) >= 3:
+                # Format: idx,temp,duty
+                temp = float(parts[1])
+                duty = float(parts[2])
+                lut.append((temp, duty))
+        return lut
+
+    def get_lut_adc_to_temp(self) -> List[Tuple[int, float]]:
+        """Get ADC_TO_TEMP_5C LUT from device."""
+        first, lines = self.cmd("GET LUT ADC_TO_TEMP_5C", expect_multiline=True, deadline_s=2.0)
+        if not first.startswith("OK"):
+            raise RuntimeError(first)
+        lut = []
+        for s in lines:
+            if s == "END":
+                break
+            if s.startswith("COUNT"):
+                continue
+            parts = s.split(",")
+            if len(parts) >= 3:
+                # Format: idx,adc,temp
+                adc = int(parts[1])
+                temp = float(parts[2])
+                lut.append((adc, temp))
+        return lut
+
 # ------------------------------
 # Tk helpers: tooltip bubbles
 # ------------------------------
@@ -439,7 +529,6 @@ class App(ttk.Frame):
             ("FanIdx", "fan_idx"),
             ("Duty (%)", "duty_pct"),
             ("LOAD", "load"),
-            ("PG", "pg"),
             ("Mode", "mode"),
         ]
         for r, (label, key) in enumerate(fields):
@@ -487,6 +576,7 @@ class App(ttk.Frame):
         ttk.Button(actions, text="Refresh Params", command=self.on_refresh).grid(row=0, column=0, padx=4)
         ttk.Button(actions, text="Apply Params", command=self.on_apply).grid(row=0, column=1, padx=4)
         ttk.Button(actions, text="Save to Flash", command=self.on_save).grid(row=0, column=2, padx=4)
+        ttk.Button(actions, text="Export YAML", command=self.on_export_yaml).grid(row=0, column=12, padx=4)
         ttk.Button(actions, text="Fan Auto", command=lambda: self._send('FAN AUTO')).grid(row=0, column=3, padx=4)
         # Manual Fan Duty Entry (percent)
         # ttk.Label(actions, text="Fan Duty (%):").grid(row=0, column=4, padx=4)
@@ -531,7 +621,7 @@ class App(ttk.Frame):
             self._open_dev(port)
             self.status.set(f"Connected on {port}")
         except Exception as e:
-            messagebox.showerror("Connect", str(e))
+            show_error_dialog("Connect Error", str(e), traceback.format_exc())
             self.status.set("Disconnected")
 
     def on_autoconnect(self) -> None:
@@ -693,7 +783,6 @@ class App(ttk.Frame):
         setv("fan_idx")
         setv("duty_pct", lambda x: f"{x:.0f}")
         setv("load")
-        setv("pg")
         setv("mode")
 
         # Keep latest numeric telemetry for recording
@@ -765,7 +854,7 @@ class App(ttk.Frame):
                     writer.writerows(self.rec_data)
                 self.status.set(f"Saved {len(self.rec_data)} samples → {path}")
             except Exception as e:
-                messagebox.showerror("Save CSV", str(e))
+                show_error_dialog("Save CSV Error", str(e), traceback.format_exc())
         else:
             # User canceled save dialog; keep data for this session
             self.status.set("Recording stopped (save canceled)")
@@ -839,16 +928,28 @@ class App(ttk.Frame):
             self.on_refresh()
             messagebox.showinfo("Cal VIN (1pt)", f"VIN_CAL_A set to {a_new:.6f}\nAveraged reading: {v_avg:.6f} V\nOffset (B) assumed 0.0 V")
         except Exception as e:
-            messagebox.showerror("Cal VIN (1pt)", str(e))
+            show_error_dialog("Cal VIN (1pt) Error", str(e), traceback.format_exc())
 
     def on_cal_vin_2pt(self) -> None:
         """Calibrate VIN slope (A) and offset (B) using two points and averaged readings."""
         if not self.dev:
             return
         try:
+            # Save current calibration
+            old_a = self.param_vars["VIN_CAL_A"].get()
+            old_b = self.param_vars["VIN_CAL_B"].get()
+            
+            # Set to passthrough (raw) for calibration
+            self.dev.set_param("VIN_CAL_A", "1.0")
+            self.dev.set_param("VIN_CAL_B", "0.0")
+            time.sleep(0.5)  # Let it stabilize
+            
             # First point
             s1 = tk.simpledialog.askstring(APP_NAME, "Enter actual VIN #1 (Volts), then click OK:")
             if not s1:
+                # Restore old calibration
+                self.dev.set_param("VIN_CAL_A", str(old_a))
+                self.dev.set_param("VIN_CAL_B", str(old_b))
                 return
             v1 = float(s1)
             messagebox.showinfo("Cal VIN (2pt)", "Averaging readings for 5 seconds at VIN #1...")
@@ -859,11 +960,14 @@ class App(ttk.Frame):
                     telem = self.dev.telem_queue.get(timeout=0.5)
                     parts = telem.split(",")
                     if len(parts) >= 1:
-                        vin_read = float(parts[0])
-                        readings1.append(vin_read)
+                        vin_raw = float(parts[0])  # Now raw because cal is disabled
+                        readings1.append(vin_raw)
                 except Exception:
                     pass
             if not readings1:
+                # Restore old calibration
+                self.dev.set_param("VIN_CAL_A", str(old_a))
+                self.dev.set_param("VIN_CAL_B", str(old_b))
                 raise RuntimeError("No VIN readings received for point 1.")
             vin_raw1 = sum(readings1) / len(readings1)
 
@@ -871,6 +975,9 @@ class App(ttk.Frame):
             messagebox.showinfo("Cal VIN (2pt)", "Now change to the second known VIN and press OK")
             s2 = tk.simpledialog.askstring(APP_NAME, "Enter actual VIN #2 (Volts), then click OK:")
             if not s2:
+                # Restore old calibration
+                self.dev.set_param("VIN_CAL_A", str(old_a))
+                self.dev.set_param("VIN_CAL_B", str(old_b))
                 return
             v2 = float(s2)
             messagebox.showinfo("Cal VIN (2pt)", "Averaging readings for 5 seconds at VIN #2...")
@@ -881,26 +988,36 @@ class App(ttk.Frame):
                     telem = self.dev.telem_queue.get(timeout=0.5)
                     parts = telem.split(",")
                     if len(parts) >= 1:
-                        vin_read = float(parts[0])
-                        readings2.append(vin_read)
+                        vin_raw = float(parts[0])  # Now raw because cal is disabled
+                        readings2.append(vin_raw)
                 except Exception:
                     pass
             if not readings2:
+                # Restore old calibration
+                self.dev.set_param("VIN_CAL_A", str(old_a))
+                self.dev.set_param("VIN_CAL_B", str(old_b))
                 raise RuntimeError("No VIN readings received for point 2.")
             vin_raw2 = sum(readings2) / len(readings2)
 
             if abs(vin_raw2 - vin_raw1) < 1e-6:
+                # Restore old calibration
+                self.dev.set_param("VIN_CAL_A", str(old_a))
+                self.dev.set_param("VIN_CAL_B", str(old_b))
                 raise RuntimeError("Raw readings too close; choose distinct points.")
 
             # Calculate slope (A) and offset (B)
+            # actual = A * raw + B
+            # v1 = A * vin_raw1 + B
+            # v2 = A * vin_raw2 + B
             a_new = (v2 - v1) / (vin_raw2 - vin_raw1)
             b_new = v1 - a_new * vin_raw1
+            
             self.dev.set_param("VIN_CAL_A", str(a_new))
             self.dev.set_param("VIN_CAL_B", str(b_new))
             self.on_refresh()
             messagebox.showinfo("Cal VIN (2pt)", f"VIN_CAL_A={a_new:.6f}\nVIN_CAL_B={b_new:.6f}")
         except Exception as e:
-            messagebox.showerror("Cal VIN (2pt)", str(e))
+            show_error_dialog("Cal VIN (2pt) Error", str(e), traceback.format_exc())
 
     def on_cal_temp_1pt(self) -> None:
         """Calibrate temperature offset by averaging readings for 5 seconds and comparing to actual temperature."""
@@ -933,7 +1050,7 @@ class App(ttk.Frame):
             self.on_refresh()
             messagebox.showinfo("Cal TEMP (1pt)", f"TEMP_CAL_B set to {b_new:.3f} °C\nAveraged reading: {t_avg:.3f} °C")
         except Exception as e:
-            messagebox.showerror("Cal TEMP (1pt)", str(e))
+            show_error_dialog("Cal TEMP (1pt) Error", str(e), traceback.format_exc())
 
     # ---- parameter flows ----
     def on_refresh(self) -> None:
@@ -998,7 +1115,7 @@ class App(ttk.Frame):
             else:
                 self.status.set("Parameters loaded")
         except Exception as e:
-            messagebox.showerror("Refresh", str(e))
+            show_error_dialog("Refresh Error", str(e), traceback.format_exc())
 
     def on_apply(self) -> None:
         if not self.dev:
@@ -1055,7 +1172,7 @@ class App(ttk.Frame):
             else:
                 self.status.set("Parameters applied")
         except Exception as e:
-            messagebox.showerror("Apply", str(e))
+            show_error_dialog("Apply Error", str(e), traceback.format_exc())
 
     def on_save(self) -> None:
         if not self.dev:
@@ -1064,7 +1181,64 @@ class App(ttk.Frame):
             info = self.dev.save()
             messagebox.showinfo("Save", f"Saved: {info}")
         except Exception as e:
-            messagebox.showerror("Save", str(e))
+            show_error_dialog("Save Error", str(e), traceback.format_exc())
+
+    def on_export_yaml(self) -> None:
+        """Export current parameters and LUTs to YAML file for use as factory defaults."""
+        if not self.dev:
+            messagebox.showwarning(APP_NAME, "Connect to a device first.")
+            return
+        try:
+            # Get current parameters
+            params_dict = {}
+            for key in PARAM_ORDER:
+                val = self.param_vars[key].get()
+                # Convert to appropriate type
+                if key == "BYPASS_VIN_CUTOFF":
+                    params_dict[key] = float(val)  # IntVar stores 0/1
+                elif key in ("FAST_DT_MS", "SLOW_DT_MS", "RAMP_TIME_MS", "RAMP_STEP_MS", "TELEM_RATE_MS"):
+                    params_dict[key] = int(float(val))
+                elif key == "TELEM_FORMAT":
+                    params_dict[key] = str(val)
+                else:
+                    params_dict[key] = float(val)
+            
+            # Get LUTs
+            temp_to_duty_lut = self.dev.get_lut_temp_to_duty()
+            adc_to_temp_lut = self.dev.get_lut_adc_to_temp()
+            
+            # Prepare YAML structure
+            config = {
+                'firmware_version': self.fw_version_str if self.fw_version_str else 'unknown',
+                'exported_timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'parameters': params_dict,
+                'TEMP_TO_DUTY': [{'temp_c': t, 'duty': d} for t, d in temp_to_duty_lut],
+                'ADC_TO_TEMP_5C': [{'adc_count': a, 'temp_c': t} for a, t in adc_to_temp_lut]
+            }
+            
+            # Ask where to save
+            filename = filedialog.asksaveasfilename(
+                title="Export Configuration to YAML",
+                defaultextension=".yaml",
+                filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")],
+                initialfile=f"eddy_config_{time.strftime('%Y%m%d_%H%M%S')}.yaml"
+            )
+            
+            if not filename:
+                return
+            
+            # Write YAML
+            with open(filename, 'w') as f:
+                f.write("# E-DDY Configuration Export\n")
+                f.write(f"# Generated: {config['exported_timestamp']}\n")
+                f.write(f"# Firmware: {config['firmware_version']}\n\n")
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+            
+            messagebox.showinfo("Export YAML", f"Configuration exported to:\n{filename}")
+            self.status.set(f"Exported to {filename}")
+            
+        except Exception as e:
+            show_error_dialog("Export YAML Error", str(e), traceback.format_exc())
 
     # ---- misc ----
     def _send(self, line: str) -> None:
@@ -1073,7 +1247,7 @@ class App(ttk.Frame):
         try:
             self.dev.cmd(line)
         except Exception as e:
-            messagebox.showerror("Command", str(e))
+            show_error_dialog("Command Error", str(e), traceback.format_exc())
 
     def on_set_fan_duty(self) -> None:
         """Set manual fan duty from entry (percent)."""
@@ -1087,7 +1261,7 @@ class App(ttk.Frame):
             self.dev.cmd(f"FAN DUTY {duty}")
             self.status.set(f"Fan duty set to {val:.0f}%")
         except Exception as e:
-            messagebox.showerror("Fan Duty", str(e))
+            show_error_dialog("Fan Duty Error", str(e), traceback.format_exc())
 
 
 # ------------------------------

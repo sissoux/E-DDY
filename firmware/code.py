@@ -9,7 +9,7 @@ Responsibilities:
 - Hardware init (ADC, GPIO, PWM).
 - Filtering (IIR), calibration (a*x+b), and temperature conversion (LUT).
 - Fan policy with LUT + hysteresis + linear ramp; manual override support.
-- Load cutoff with hysteresis; LED bonded to LOAD_EN.
+- Load cutoff with hysteresis; status LED shows heartbeat.
 - Telemetry generation (OFF by default).
 - NVM-backed settings persistence with CRC and adaptive size.
 - Integration with uart_cmd.CommandServer for UART protocol.
@@ -35,6 +35,7 @@ import board
 import analogio
 import digitalio
 import pwmio
+from microcontroller import pin
 
 from LUTs import ADC_TO_TEMP_5C as ADC_TO_TEMP_BOOT, TEMP_TO_DUTY as TEMP_TO_DUTY_BOOT
 from uart_cmd import DualCDC, CommandServer
@@ -42,7 +43,7 @@ from uart_cmd import DualCDC, CommandServer
 # -------------------------------
 # Version / constants
 # -------------------------------
-FW_VERSION = "1.3.1"  # Bumped version: distinguishes builds with VIN bypass param & GUI sync improvements
+FW_VERSION = "2.0.0"  # New hardware revision
 VREF = 3.3
 ADC_MAX = 65535
 SETTINGS_PATH = "/settings.json"  # optional file fallback (read-only while mounted)
@@ -51,21 +52,18 @@ BROKEN_TEMP_CUTOFF_C = -25.0  # Safety: if measured temperature is below this, t
 # -------------------------------
 # Hardware setup
 # -------------------------------
-vinADC = analogio.AnalogIn(board.A0)   # GP26 ADC0 — input voltage sense
-tempADC = analogio.AnalogIn(board.A1)  # GP27 ADC1 — temperature sense
+# Direct GPIO mapping (not using board aliases)
+vinADC = analogio.AnalogIn(pin.GPIO26)    # GPIO26 ADC0 — input voltage sense
+tempADC = analogio.AnalogIn(pin.GPIO27)   # GPIO27 ADC1 — temperature sense (NTC)
 
-psu_power_good = digitalio.DigitalInOut(board.GP6)  # PSU power good (pulled-up)
-psu_power_good.direction = digitalio.Direction.INPUT
-psu_power_good.pull = digitalio.Pull.UP
-
-fan = pwmio.PWMOut(board.GP13, frequency=1000, duty_cycle=0)  # 1 kHz Fan PWM
+fan = pwmio.PWMOut(pin.GPIO13, frequency=1000, duty_cycle=0)  # GPIO13 — 1 kHz Fan PWM
 # NEW: Fan tachometer input (external pull-up)
-fan_tach = digitalio.DigitalInOut(board.GP12)
+fan_tach = digitalio.DigitalInOut(pin.GPIO12)  # GPIO12 — Fan tachometer
 fan_tach.direction = digitalio.Direction.INPUT
-load_en = digitalio.DigitalInOut(board.GP28)                   # Load enable
+load_en = digitalio.DigitalInOut(pin.GPIO28)   # GPIO28 — Load enable
 load_en.direction = digitalio.Direction.OUTPUT
-led = digitalio.DigitalInOut(board.GP4)                        # LED bonded to LOAD_EN
-led.direction = digitalio.Direction.OUTPUT
+status_led = digitalio.DigitalInOut(pin.GPIO4)  # GPIO4 — Status LED (heartbeat)
+status_led.direction = digitalio.Direction.OUTPUT
 
 # -------------------------------
 # Parameters (editable via UART)
@@ -87,10 +85,10 @@ params = {
     "TELEM_FORMAT":  "HUMAN",   # "CSV" or "HUMAN"
 
     # Calibration on volts: y = a*x + b
-    "TEMP_CAL_A":    1.0,
-    "TEMP_CAL_B":    0.0,
-    "VIN_CAL_A":     (10.0/100.9),
-    "VIN_CAL_B":     0.0,
+    "TEMP_CAL_A":    1.15,
+    "TEMP_CAL_B":    -12,
+    "VIN_CAL_A":     10.1913,
+    "VIN_CAL_B":     0.278595,
 
     # Added parameters for load cutoff on voltage
     "LOAD_TRIP_V":   8.5,       # Voltage cutoff threshold (V)
@@ -98,11 +96,15 @@ params = {
     # Bypass VIN cutoff (1.0 = bypass enabled, 0.0 = enforce VIN cutoff). When bypassed, only temperature governs cutoff.
     "BYPASS_VIN_CUTOFF": 1.0,
 
-    # NEW: Fan presence checking / LED blink
+    # NEW: Fan presence checking
     "FAN_CHECK_MIN_DUTY": 0.30,   # Only check tach when commanded duty >= this
     "FAN_SPINUP_MS":     1500,    # Grace after starting fan before checking
     "FAN_TACH_TIMEOUT_MS": 600,   # Fault if no edge seen within this window
-    "LED_BLINK_MS":       300,    # Blink period when in fan-fault
+    
+    # Status LED heartbeat (double-beat pattern)
+    "HEARTBEAT_ON_MS":      100,    # LED on duration in each beat
+    "HEARTBEAT_OFF_MS":     100,    # LED off duration between beats in pair
+    "HEARTBEAT_PAUSE_MS":  3000,    # Pause between beat pairs
 }
 
 # -------------------------------
@@ -140,12 +142,15 @@ fan_manual = False  # set true by FAN DUTY; unset by FAN AUTO
 # Telemetry
 last_telem_ms = 0
 
-# NEW: Fan tach / LED blink state
+# NEW: Fan tach state
 last_tach_val = False
 last_tach_edge_ms = 0
 fan_spin_request_ms = 0
-last_led_blink_ms = 0
-led_blink_state = False
+
+# Status LED heartbeat state (double-beat pattern)
+last_heartbeat_ms = 0
+heartbeat_state = False  # True = LED on, False = LED off
+heartbeat_beat_count = 0  # 0 or 1 (which beat in the pair)
 
 # -------------------------------
 # Utility functions
@@ -467,9 +472,9 @@ def load_defaults_ram():
             "TELEM_RATE_MS": 0,  # OFF by default
             "TELEM_FORMAT": "HUMAN",
             "TEMP_CAL_A": 1.0,
-            "TEMP_CAL_B": 0.0,
-            "VIN_CAL_A": (10.0 / 100.9),
-            "VIN_CAL_B": 0.0,
+            "TEMP_CAL_B": -7.5,
+            "VIN_CAL_A": 10.1913,
+            "VIN_CAL_B": 0.278595,
             "LOAD_TRIP_V": 8.5,   # Default voltage cutoff
             "HYST_V": 0.5,        # Default voltage hysteresis
             "BYPASS_VIN_CUTOFF": 1.0,  # Default: bypass VIN cutoff enabled
@@ -477,7 +482,10 @@ def load_defaults_ram():
             "FAN_CHECK_MIN_DUTY": 0.30,
             "FAN_SPINUP_MS":     1500,
             "FAN_TACH_TIMEOUT_MS": 600,
-            "LED_BLINK_MS":       300,
+            # Heartbeat (double-beat pattern)
+            "HEARTBEAT_ON_MS": 100,
+            "HEARTBEAT_OFF_MS": 100,
+            "HEARTBEAT_PAUSE_MS": 3000,
         }
     )
     TEMP_TO_DUTY[:] = [(float(t), float(d)) for (t, d) in TEMP_TO_DUTY_BOOT]
@@ -532,10 +540,13 @@ class Backend:
             "FAN_CHECK_MIN_DUTY",
             "FAN_SPINUP_MS",
             "FAN_TACH_TIMEOUT_MS",
-            "LED_BLINK_MS",
+            "HEARTBEAT_ON_MS",
+            "HEARTBEAT_OFF_MS",
+            "HEARTBEAT_PAUSE_MS",
         ]
         for k in keys:
-            lines.append("{}={}".format(k, params[k]))
+            if k in params:  # Safety check to avoid KeyError
+                lines.append("{}={}".format(k, params[k]))
         return lines
 
     def set_param(self, key: str, value: str) -> None:
@@ -543,7 +554,7 @@ class Backend:
         if key not in params:
             raise KeyError("UNKNOWN_KEY")
         if key in ("FAST_DT_MS", "SLOW_DT_MS", "RAMP_TIME_MS", "RAMP_STEP_MS", "TELEM_RATE_MS",
-                   "FAN_SPINUP_MS", "FAN_TACH_TIMEOUT_MS", "LED_BLINK_MS"):
+                   "FAN_SPINUP_MS", "FAN_TACH_TIMEOUT_MS", "HEARTBEAT_ON_MS", "HEARTBEAT_OFF_MS", "HEARTBEAT_PAUSE_MS"):
             params[key] = int(float(value))
         elif key == "TELEM_FORMAT":
             v = value.strip().upper()
@@ -641,10 +652,13 @@ last_telem_ms = t_fast
 last_ramp_ms = t_fast
 ramp_start_ms = t_fast
 last_temp_c = 25.0
-# NEW: initialize tach/blink timers
+# NEW: initialize tach timers
 last_tach_edge_ms = t_fast
-last_led_blink_ms = t_fast
 last_tach_val = fan_tach.value
+# Initialize heartbeat (double-beat pattern)
+last_heartbeat_ms = t_fast
+heartbeat_state = False
+heartbeat_beat_count = 0
 
 # -------------------------------
 # Startup LED version blink
@@ -657,9 +671,9 @@ def _blink_n(n: int, on_ms: int = 150, off_ms: int = 150) -> None:
     if n <= 0:
         return
     for i in range(n):
-        led.value = True
+        status_led.value = True
         time.sleep(on_ms / 1000.0)
-        led.value = False
+        status_led.value = False
         if i != n - 1:
             time.sleep(off_ms / 1000.0)
 
@@ -690,7 +704,7 @@ def blink_version() -> None:
     time.sleep(1.0)
     _blink_n(minr)
     time.sleep(0.2)
-    led.value = False
+    status_led.value = False
 
 # Perform version blink at startup (non-blocking thereafter)
 blink_version()
@@ -778,43 +792,55 @@ while True:
         load_enabled = base_load_enabled and (not fan_fault) and (not temp_fault_low)
         load_en.value = load_enabled
 
-        # NEW: LED blinking on fan fault, else mirror LOAD_EN
-        if fan_fault and should_check_fan:
-            if (t - last_led_blink_ms) >= params["LED_BLINK_MS"]:
-                last_led_blink_ms = t
-                led_blink_state = not led_blink_state
-            led.value = led_blink_state
+        # Status LED heartbeat (double-beat pattern, independent of load state)
+        if heartbeat_state:
+            # LED is ON, check if on-time expired
+            if (t - last_heartbeat_ms) >= params["HEARTBEAT_ON_MS"]:
+                heartbeat_state = False
+                status_led.value = False
+                last_heartbeat_ms = t
         else:
-            led.value = load_enabled
+            # LED is OFF, check which pause to use
+            if heartbeat_beat_count == 0:
+                # First beat done, short pause before second beat
+                if (t - last_heartbeat_ms) >= params["HEARTBEAT_OFF_MS"]:
+                    heartbeat_state = True
+                    status_led.value = True
+                    heartbeat_beat_count = 1
+                    last_heartbeat_ms = t
+            else:
+                # Second beat done, long pause before next pair
+                if (t - last_heartbeat_ms) >= params["HEARTBEAT_PAUSE_MS"]:
+                    heartbeat_state = True
+                    status_led.value = True
+                    heartbeat_beat_count = 0
+                    last_heartbeat_ms = t
 
     # 3) Telemetry (OFF by default)
     if params["TELEM_RATE_MS"] > 0 and (t - last_telem_ms >= params["TELEM_RATE_MS"]):
         last_telem_ms = t
-        pg_status = "OK" if psu_power_good.value else "FAIL"
         mode = "MAN" if fan_manual else "AUTO"
         if params["TELEM_FORMAT"].upper() == "CSV":
             io.write_line(
-                "{:.3f},{:.3f},{:.1f},{},{:.0f},{},{},{}".format(
+                "{:.3f},{:.3f},{:.1f},{},{:.0f},{},{}".format(
                     params["VIN_CAL_A"] * ((raw_vin_f * VREF) / ADC_MAX) + params["VIN_CAL_B"],
                     params["TEMP_CAL_A"] * ((raw_temp_f * VREF) / ADC_MAX) + params["TEMP_CAL_B"],
                     last_temp_c,
                     lut_index,
                     duty_cmd * 100.0,
                     "ON" if load_enabled else "OFF",
-                    pg_status,
                     mode,
                 )
             )
         else:
             io.write_line(
-                "VIN={:.3f}V TEMPADC={:.3f}V T={:.1f}C FanIdx={} Duty={:.0f}% LOAD={} PG={} MODE={}".format(
+                "VIN={:.3f}V TEMPADC={:.3f}V T={:.1f}C FanIdx={} Duty={:.0f}% LOAD={} MODE={}".format(
                     params["VIN_CAL_A"] * ((raw_vin_f * VREF) / ADC_MAX) + params["VIN_CAL_B"],
                     params["TEMP_CAL_A"] * ((raw_temp_f * VREF) / ADC_MAX) + params["TEMP_CAL_B"],
                     last_temp_c,
                     lut_index,
                     duty_cmd * 100.0,
                     "ON" if load_enabled else "OFF",
-                    pg_status,
                     mode,
                 )
             )
