@@ -94,7 +94,7 @@ params = {
     "LOAD_TRIP_V":   8.5,       # Voltage cutoff threshold (V)
     "HYST_V":        0.5,       # Voltage hysteresis (V)
     # Bypass VIN cutoff (1.0 = bypass enabled, 0.0 = enforce VIN cutoff). When bypassed, only temperature governs cutoff.
-    "BYPASS_VIN_CUTOFF": 1.0,
+    "BYPASS_VIN_CUTOFF": 0.0,
 
     # NEW: Fan presence checking
     "FAN_CHECK_MIN_DUTY": 0.30,   # Only check tach when commanded duty >= this
@@ -105,6 +105,9 @@ params = {
     "HEARTBEAT_ON_MS":      100,    # LED on duration in each beat
     "HEARTBEAT_OFF_MS":     100,    # LED off duration between beats in pair
     "HEARTBEAT_PAUSE_MS":  3000,    # Pause between beat pairs
+    
+    # Status LED fault indicators
+    "FAULT_BLINK_MS":       100,    # Fast blink period for overtemperature fault (50% duty)
 }
 
 # -------------------------------
@@ -128,6 +131,7 @@ lut_index = 0
 load_enabled = True
 base_load_enabled = True  # NEW: temp/VIN policy before fan interlock
 fan_fault = False         # NEW: fan fault flag
+fault_cause = None        # Track fault cause: "OVERTEMP", "VIN_CUTOFF", or None
 temp_fault_low = False    # NEW: broken sensor safety (NTC open → very low apparent temp)
 
 # Fan ramp
@@ -780,41 +784,61 @@ while True:
         # Updated load policy: independent temp and VIN cutoffs with bypass support.
         bypass_vin = params.get("BYPASS_VIN_CUTOFF", 1.0) >= 0.5
         if base_load_enabled:
-            # Trip if temperature exceeds threshold OR (VIN below threshold AND not bypassed)
-            if (last_temp_c >= params["LOAD_TRIP_C"]) or ((not bypass_vin) and (vin_v < (params["LOAD_TRIP_V"] - params["HYST_V"]))):
+            # Trip if temperature exceeds threshold OR (VIN below trip point AND not bypassed)
+            temp_tripped = (last_temp_c >= params["LOAD_TRIP_C"])
+            vin_tripped = (not bypass_vin) and (vin_v < params["LOAD_TRIP_V"])
+            if temp_tripped or vin_tripped:
                 base_load_enabled = False
+                # Track which condition caused the fault
+                if temp_tripped:
+                    fault_cause = "OVERTEMP"
+                elif vin_tripped:
+                    fault_cause = "VIN_CUTOFF"
         else:
-            # Re-enable if temp falls sufficiently OR (VIN recovers above threshold AND not bypassed)
-            if (last_temp_c <= (params["LOAD_TRIP_C"] - params["HYST_C"])) or ((not bypass_vin) and (vin_v >= params["LOAD_TRIP_V"])):
+            # Re-enable if temp falls sufficiently AND (VIN recovers above trip+hyst OR bypassed)
+            temp_ok = (last_temp_c <= (params["LOAD_TRIP_C"] - params["HYST_C"]))
+            vin_ok = bypass_vin or (vin_v >= (params["LOAD_TRIP_V"] + params["HYST_V"]))
+            if temp_ok and vin_ok:
                 base_load_enabled = True
+                fault_cause = None
 
         # NEW: Apply interlocks: no fan OR broken sensor → no load
         load_enabled = base_load_enabled and (not fan_fault) and (not temp_fault_low)
         load_en.value = load_enabled
 
-        # Status LED heartbeat (double-beat pattern, independent of load state)
-        if heartbeat_state:
-            # LED is ON, check if on-time expired
-            if (t - last_heartbeat_ms) >= params["HEARTBEAT_ON_MS"]:
-                heartbeat_state = False
-                status_led.value = False
+        # Status LED behavior depends on fault state
+        if fault_cause == "OVERTEMP":
+            # Fast continuous blink for overtemperature (50% duty cycle)
+            if (t - last_heartbeat_ms) >= params["FAULT_BLINK_MS"]:
+                status_led.value = not status_led.value
                 last_heartbeat_ms = t
+        elif fault_cause == "VIN_CUTOFF":
+            # Steady ON for VIN cutoff
+            status_led.value = True
         else:
-            # LED is OFF, check which pause to use
-            if heartbeat_beat_count == 0:
-                # First beat done, short pause before second beat
-                if (t - last_heartbeat_ms) >= params["HEARTBEAT_OFF_MS"]:
-                    heartbeat_state = True
-                    status_led.value = True
-                    heartbeat_beat_count = 1
+            # Normal heartbeat (double-beat pattern)
+            if heartbeat_state:
+                # LED is ON, check if on-time expired
+                if (t - last_heartbeat_ms) >= params["HEARTBEAT_ON_MS"]:
+                    heartbeat_state = False
+                    status_led.value = False
                     last_heartbeat_ms = t
             else:
-                # Second beat done, long pause before next pair
-                if (t - last_heartbeat_ms) >= params["HEARTBEAT_PAUSE_MS"]:
-                    heartbeat_state = True
-                    status_led.value = True
-                    heartbeat_beat_count = 0
-                    last_heartbeat_ms = t
+                # LED is OFF, check which pause to use
+                if heartbeat_beat_count == 0:
+                    # First beat done, short pause before second beat
+                    if (t - last_heartbeat_ms) >= params["HEARTBEAT_OFF_MS"]:
+                        heartbeat_state = True
+                        status_led.value = True
+                        heartbeat_beat_count = 1
+                        last_heartbeat_ms = t
+                else:
+                    # Second beat done, long pause before next pair
+                    if (t - last_heartbeat_ms) >= params["HEARTBEAT_PAUSE_MS"]:
+                        heartbeat_state = True
+                        status_led.value = True
+                        heartbeat_beat_count = 0
+                        last_heartbeat_ms = t
 
     # 3) Telemetry (OFF by default)
     if params["TELEM_RATE_MS"] > 0 and (t - last_telem_ms >= params["TELEM_RATE_MS"]):
