@@ -1,9 +1,9 @@
 # E-DDY Configuration Export
-# Generated: 2025-12-09 18:05:08
+# Generated: 2025-12-11 18:09:38
 # Firmware: 2.0.0
 
 firmware_version: 2.0.0
-exported_timestamp: '2025-12-09 18:05:08'
+exported_timestamp: '2025-12-11 18:09:38'
 parameters:
   MIN_FAN_DUTY: 20.0
   HYST_C: 5.0
@@ -15,13 +15,13 @@ parameters:
   RAMP_STEP_MS: 50
   TELEM_RATE_MS: 250
   TELEM_FORMAT: CSV
-  TEMP_CAL_A: 1.0
-  TEMP_CAL_B: -7.5
+  TEMP_CAL_A: 1.15
+  TEMP_CAL_B: -12.0
   VIN_CAL_A: 10.1913
   VIN_CAL_B: 0.278595
   LOAD_TRIP_V: 8.5
   HYST_V: 0.5
-  BYPASS_VIN_CUTOFF: 1.0
+  BYPASS_VIN_CUTOFF: 0.0
 TEMP_TO_DUTY:
 - temp_c: 40.0
   duty: 0.35
