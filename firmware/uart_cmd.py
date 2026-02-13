@@ -32,6 +32,7 @@ Application must provide a backend object with the following callables:
 - telem_format(fmt: str) -> None              # "CSV" or "HUMAN"
 - save_settings() -> tuple[bool, str]         # (ok, info)
 - load_defaults() -> None
+- reload_luts_from_file() -> None             # Reload LUTs from LUTs.py
 - reboot() -> None
 
 The server will call these and handle I/O formatting.
@@ -284,6 +285,7 @@ class CommandServer:
                     "TELEM FORMAT CSV|HUMAN",
                     "SAVE",
                     "DEFAULTS",
+                    "RELOAD LUTS",
                     "REBOOT",
                 ]
             )
@@ -382,6 +384,11 @@ class CommandServer:
 
         if up == "DEFAULTS":
             self.backend.load_defaults()
+            self.ok()
+            return
+
+        if up == "RELOAD LUTS":
+            self.backend.reload_luts_from_file()
             self.ok()
             return
 

@@ -2,10 +2,10 @@
 # © 2025 ADSTech [e-ddy]
 # https://ohwr.org/licences/
 
-import argparse
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
+from tkinter import Tk, filedialog
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -66,9 +66,19 @@ def simple_plot(csv_path: str, save_png: bool = True):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Plot temperature vs time and print max temperature.")
-    parser.add_argument("csv", nargs="?", default="Double Cycle test 1.csv", help="Path to CSV file")
-    parser.add_argument("--no-save", action="store_true", help="Don't save PNG next to CSV")
-    args = parser.parse_args()
-
-    simple_plot(args.csv, save_png=(not args.no_save))
+    # Create a Tk root window (hidden)
+    root = Tk()
+    root.withdraw()
+    
+    # Open file dialog to select CSV file
+    csv_path = filedialog.askopenfilename(
+        title="Select CSV file to plot",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        initialdir=os.path.dirname(__file__)
+    )
+    
+    # Exit if no file selected
+    if not csv_path:
+        print("No file selected. Exiting.")
+    else:
+        simple_plot(csv_path, save_png=True)

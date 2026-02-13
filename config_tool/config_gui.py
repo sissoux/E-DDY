@@ -50,7 +50,7 @@ from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "E-DDY Config"
 EXPECTED_NAME = "E-DDY"
-MIN_FW = (1, 3, 1)  # minimal compatible firmware version (major, minor, patch)
+MIN_FW = (2, 1, 0)  # minimal compatible firmware version (major, minor, patch)
 
 
 # Custom error dialog with copy-to-clipboard functionality
@@ -576,6 +576,8 @@ class App(ttk.Frame):
         ttk.Button(actions, text="Refresh Params", command=self.on_refresh).grid(row=0, column=0, padx=4)
         ttk.Button(actions, text="Apply Params", command=self.on_apply).grid(row=0, column=1, padx=4)
         ttk.Button(actions, text="Save to Flash", command=self.on_save).grid(row=0, column=2, padx=4)
+        ttk.Button(actions, text="Reload LUTs", command=self.on_reload_luts).grid(row=0, column=14, padx=4)
+        ttk.Button(actions, text="Read TEMP_TO_DUTY", command=self.on_read_temp_to_duty).grid(row=0, column=13, padx=4)
         ttk.Button(actions, text="Export YAML", command=self.on_export_yaml).grid(row=0, column=12, padx=4)
         ttk.Button(actions, text="Fan Auto", command=lambda: self._send('FAN AUTO')).grid(row=0, column=3, padx=4)
         # Manual Fan Duty Entry (percent)
@@ -1183,6 +1185,101 @@ class App(ttk.Frame):
         except Exception as e:
             show_error_dialog("Save Error", str(e), traceback.format_exc())
 
+    def on_reload_luts(self) -> None:
+        """Reload LUTs from LUTs.py file on the device."""
+        if not self.dev:
+            messagebox.showwarning(APP_NAME, "Connect to a device first.")
+            return
+        
+        # Confirm action
+        result = messagebox.askyesno(
+            "Reload LUTs",
+            "This will reload the TEMP_TO_DUTY and ADC_TO_TEMP_5C lookup tables\n"
+            "from the LUTs.py file on the device.\n\n"
+            "Current LUT values in RAM will be replaced.\n\n"
+            "Do you want to continue?"
+        )
+        
+        if not result:
+            return
+        
+        try:
+            # Send RELOAD LUTS command
+            first, _ = self.dev.cmd("RELOAD LUTS", deadline_s=1.0)
+            if first.startswith("OK"):
+                messagebox.showinfo("Reload LUTs", "LUTs reloaded successfully from LUTs.py")
+                self.status.set("LUTs reloaded from file")
+            else:
+                messagebox.showerror("Reload LUTs", f"Unexpected response: {first}")
+        except Exception as e:
+            show_error_dialog("Reload LUTs Error", str(e), traceback.format_exc())
+
+    def on_read_temp_to_duty(self) -> None:
+        """Read and display the current TEMP_TO_DUTY LUT from the device."""
+        if not self.dev:
+            messagebox.showwarning(APP_NAME, "Connect to a device first.")
+            return
+        try:
+            # Get the LUT from device
+            lut = self.dev.get_lut_temp_to_duty()
+            
+            # Create a dialog to display the table
+            dialog = tk.Toplevel(self)
+            dialog.title("TEMP_TO_DUTY Table")
+            dialog.geometry("400x500")
+            dialog.resizable(True, True)
+            
+            # Create frame with scrollbar
+            frame = ttk.Frame(dialog, padding=10)
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Add text widget with scrollbar
+            scroll = ttk.Scrollbar(frame)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            text = tk.Text(frame, wrap=tk.NONE, yscrollcommand=scroll.set, font=("Courier", 10))
+            text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.config(command=text.yview)
+            
+            # Format and insert the data
+            text.insert("1.0", f"TEMP_TO_DUTY LUT ({len(lut)} entries)\n")
+            text.insert("end", "=" * 40 + "\n\n")
+            text.insert("end", f"{'Index':<8}{'Temp (°C)':<15}{'Duty (0-1)'}\n")
+            text.insert("end", "-" * 40 + "\n")
+            
+            for idx, (temp, duty) in enumerate(lut):
+                text.insert("end", f"{idx:<8}{temp:<15.1f}{duty:.3f}\n")
+            
+            text.config(state=tk.DISABLED)  # Make read-only
+            
+            # Button frame
+            btn_frame = ttk.Frame(dialog, padding=10)
+            btn_frame.pack(fill=tk.X)
+            
+            def copy_to_clipboard():
+                clipboard_text = f"TEMP_TO_DUTY LUT ({len(lut)} entries)\n"
+                clipboard_text += "Index\tTemp (°C)\tDuty\n"
+                for idx, (temp, duty) in enumerate(lut):
+                    clipboard_text += f"{idx}\t{temp:.1f}\t{duty:.3f}\n"
+                dialog.clipboard_clear()
+                dialog.clipboard_append(clipboard_text)
+                copy_btn.config(text="✓ Copied!")
+                dialog.after(1500, lambda: copy_btn.config(text="Copy to Clipboard"))
+            
+            copy_btn = ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard)
+            copy_btn.pack(side=tk.LEFT, padx=5)
+            
+            ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+            
+            # Center dialog on parent
+            dialog.transient(self)
+            dialog.grab_set()
+            
+            self.status.set(f"Read TEMP_TO_DUTY table: {len(lut)} entries")
+            
+        except Exception as e:
+            show_error_dialog("Read TEMP_TO_DUTY Error", str(e), traceback.format_exc())
+
     def on_export_yaml(self) -> None:
         """Export current parameters and LUTs to YAML file for use as factory defaults."""
         if not self.dev:
@@ -1194,7 +1291,10 @@ class App(ttk.Frame):
             for key in PARAM_ORDER:
                 val = self.param_vars[key].get()
                 # Convert to appropriate type
-                if key == "BYPASS_VIN_CUTOFF":
+                if key == "MIN_FAN_DUTY":
+                    # GUI shows as percentage (0-100), but firmware expects 0.0-1.0
+                    params_dict[key] = float(val) / 100.0
+                elif key == "BYPASS_VIN_CUTOFF":
                     params_dict[key] = float(val)  # IntVar stores 0/1
                 elif key in ("FAST_DT_MS", "SLOW_DT_MS", "RAMP_TIME_MS", "RAMP_STEP_MS", "TELEM_RATE_MS"):
                     params_dict[key] = int(float(val))

@@ -43,7 +43,7 @@ from uart_cmd import DualCDC, CommandServer
 # -------------------------------
 # Version / constants
 # -------------------------------
-FW_VERSION = "2.0.0"  # New hardware revision
+FW_VERSION = "2.1.0"  # Added RELOAD LUTS command
 VREF = 3.3
 ADC_MAX = 65535
 SETTINGS_PATH = "/settings.json"  # optional file fallback (read-only while mounted)
@@ -629,6 +629,14 @@ class Backend:
     def load_defaults(self) -> None:
         """Restore defaults in RAM."""
         load_defaults_ram()
+
+    def reload_luts_from_file(self) -> None:
+        """Reload LUTs from LUTs.py boot values (does not restore params)."""
+        global TEMP_TO_DUTY, ADC_TO_TEMP_5C
+        TEMP_TO_DUTY[:] = [(float(t), float(d)) for (t, d) in TEMP_TO_DUTY_BOOT]
+        TEMP_TO_DUTY.sort(key=lambda x: x[0])
+        ADC_TO_TEMP_5C[:] = [(int(a), float(t)) for (a, t) in ADC_TO_TEMP_BOOT]
+        ADC_TO_TEMP_5C.sort(key=lambda x: -x[0])
 
     def reboot(self) -> None:
         """Soft reset the microcontroller."""
